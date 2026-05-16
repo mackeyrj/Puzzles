@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
+import android.print.PrintDocumentInfo
 import android.print.PrintManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -134,6 +135,7 @@ fun CrosswordScreen(onBack: () -> Unit) {
     var selectedMonth by remember { mutableStateOf<String?>(null) }
     var statusText by remember { mutableStateOf("Ready") }
     var isMonthPageLoaded by remember { mutableStateOf(false) }
+    var isProcessing by remember { mutableStateOf(false) }
 
     val indexUrl = "https://freedailycrosswords.com/printable-crossword-puzzles/"
 
@@ -168,20 +170,21 @@ fun CrosswordScreen(onBack: () -> Unit) {
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         ExposedDropdownMenuBox(
-                            expanded = expanded,
-                            onExpandedChange = { expanded = !expanded },
+                            expanded = expanded && !isProcessing,
+                            onExpandedChange = { if (!isProcessing) expanded = !expanded },
                             modifier = Modifier.weight(1f)
                         ) {
                             TextField(
                                 value = selectedMonth ?: "Select Month",
                                 onValueChange = {},
                                 readOnly = true,
-                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+                                trailingIcon = { if (!isProcessing) ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                                 modifier = Modifier.menuAnchor(),
-                                colors = ExposedDropdownMenuDefaults.textFieldColors()
+                                colors = ExposedDropdownMenuDefaults.textFieldColors(),
+                                enabled = !isProcessing
                             )
                             ExposedDropdownMenu(
-                                expanded = expanded,
+                                expanded = expanded && !isProcessing,
                                 onDismissRequest = { expanded = false }
                             ) {
                                 monthLinks.keys.forEach { month ->
@@ -206,7 +209,7 @@ fun CrosswordScreen(onBack: () -> Unit) {
                                     }
                                 }
                             },
-                            enabled = selectedMonth != null
+                            enabled = selectedMonth != null && !isProcessing
                         ) {
                             Text("Process")
                         }
@@ -223,17 +226,17 @@ fun CrosswordScreen(onBack: () -> Unit) {
                         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                             IconButton(
                                 onClick = {
-                                    confirmAndProcessPdfs(webView, context, scope, true) { msg -> statusText = msg }
+                                    confirmAndProcessPdfs(webView, context, scope, true, { isProcessing = it }) { msg -> statusText = msg }
                                 },
-                                enabled = isMonthPageLoaded
+                                enabled = isMonthPageLoaded && !isProcessing
                             ) {
                                 Icon(Icons.Default.Print, contentDescription = "Print All")
                             }
                             IconButton(
                                 onClick = {
-                                    confirmAndProcessPdfs(webView, context, scope, false) { msg -> statusText = msg }
+                                    confirmAndProcessPdfs(webView, context, scope, false, { isProcessing = it }) { msg -> statusText = msg }
                                 },
-                                enabled = isMonthPageLoaded
+                                enabled = isMonthPageLoaded && !isProcessing
                             ) {
                                 Icon(Icons.Default.Email, contentDescription = "Email All")
                             }
@@ -365,8 +368,9 @@ private fun buildMonthScrapeScript(): String {
     """.trimIndent()
 }
 
-private fun confirmAndProcessPdfs(webView: WebView?, context: Context, scope: CoroutineScope, isPrint: Boolean, onStatus: (String) -> Unit) {
+private fun confirmAndProcessPdfs(webView: WebView?, context: Context, scope: CoroutineScope, isPrint: Boolean, onProcessing: (Boolean) -> Unit, onStatus: (String) -> Unit) {
     if (webView == null) return
+    onProcessing(true)
 
     val pdfScript = """
         (function(){
@@ -397,6 +401,7 @@ private fun confirmAndProcessPdfs(webView: WebView?, context: Context, scope: Co
 
             if (urls.isEmpty()) {
                 onStatus("No PDF links found")
+                onProcessing(false)
                 return@evaluateJavascript
             }
 
@@ -408,14 +413,24 @@ private fun confirmAndProcessPdfs(webView: WebView?, context: Context, scope: Co
                 .setMessage(message)
                 .setPositiveButton("Yes") { _, _ ->
                     scope.launch {
-                        downloadAndMergePdfs(urls, context, isPrint, onStatus)
+                        try {
+                            downloadAndMergePdfs(urls, context, isPrint, onStatus)
+                        } finally {
+                            onProcessing(false)
+                        }
                     }
                 }
-                .setNegativeButton("No", null)
+                .setNegativeButton("No") { _, _ ->
+                    onProcessing(false)
+                }
+                .setOnCancelListener {
+                    onProcessing(false)
+                }
                 .show()
 
         } catch (e: Exception) {
             onStatus("Error scanning links: ${e.message}")
+            onProcessing(false)
         }
     }
 }
@@ -449,7 +464,7 @@ private suspend fun downloadAndMergePdfs(urls: List<String>, context: Context, i
         }
 
         withContext(Dispatchers.Main) { onStatus("Merging PDFs...") }
-        val mergedFile = File(context.cacheDir, "puzzles.pdf")
+        val mergedFile = File(context.cacheDir, "puzzles_${System.currentTimeMillis()}.pdf")
         try {
             val merger = PDFMergerUtility()
             merger.destinationFileName = mergedFile.absolutePath
@@ -464,17 +479,18 @@ private suspend fun downloadAndMergePdfs(urls: List<String>, context: Context, i
 
             withContext(Dispatchers.Main) {
                 if (isPrint) {
-                    onStatus("Printing...")
+                    onStatus("Opening print dialog...")
                     printPdf(mergedFile, context)
                 } else {
-                    onStatus("Sharing...")
+                    onStatus("Opening sharing dialog...")
                     emailPdf(mergedFile, context)
                 }
-                // Clean up temp files
+                // Clean up temp downloaded files
                 tempDir.listFiles()?.forEach { it.delete() }
             }
         } catch (e: Exception) {
             withContext(Dispatchers.Main) { onStatus("Merge error: ${e.message}") }
+            if (mergedFile.exists()) { mergedFile.delete() }
         }
     }
 }
@@ -492,8 +508,21 @@ private fun printPdf(file: File, context: Context) {
                 callback.onLayoutCancelled()
                 return
             }
-            val info = android.print.PrintDocumentInfo.Builder("puzzles.pdf")
-                .setContentType(android.print.PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+
+            var pageCount = PrintDocumentInfo.PAGE_COUNT_UNKNOWN
+            try {
+                val pfd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+                val renderer = PdfRenderer(pfd)
+                pageCount = renderer.pageCount
+                renderer.close()
+                pfd.close()
+            } catch (e: Exception) {
+                // Fallback to unknown if renderer fails
+            }
+
+            val info = PrintDocumentInfo.Builder(file.name)
+                .setContentType(PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                .setPageCount(pageCount)
                 .build()
             callback.onLayoutFinished(info, true)
         }
@@ -502,7 +531,16 @@ private fun printPdf(file: File, context: Context) {
             try {
                 FileInputStream(file).use { input ->
                     FileOutputStream(destination.fileDescriptor).use { output ->
-                        input.copyTo(output)
+                        val buffer = ByteArray(8192)
+                        var bytesRead: Int
+                        while (input.read(buffer).also { bytesRead = it } >= 0) {
+                            if (cancellationSignal?.isCanceled == true) {
+                                callback.onWriteCancelled()
+                                return
+                            }
+                            output.write(buffer, 0, bytesRead)
+                        }
+                        output.flush()
                     }
                 }
                 callback.onWriteFinished(arrayOf(android.print.PageRange.ALL_PAGES))
