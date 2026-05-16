@@ -1,8 +1,11 @@
 package com.example.puzzles
 
 import android.app.AlertDialog
+import android.app.DatePickerDialog
 import android.content.Context
 import android.content.Intent
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.pdf.PdfRenderer
 import android.net.Uri
 import android.os.Bundle
@@ -11,17 +14,18 @@ import android.print.PrintAttributes
 import android.print.PrintDocumentAdapter
 import android.print.PrintDocumentInfo
 import android.print.PrintManager
+import android.view.View
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.EditText
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.*
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Email
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material3.*
@@ -38,10 +42,18 @@ import androidx.navigation.compose.rememberNavController
 import com.example.puzzles.ui.theme.PuzzlesTheme
 import com.tom_roush.pdfbox.multipdf.PDFMergerUtility
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPage
+import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.common.PDRectangle
+import com.tom_roush.pdfbox.pdmodel.graphics.image.LosslessFactory
 import kotlinx.coroutines.*
 import org.json.JSONArray
+import org.json.JSONObject
 import java.io.*
 import java.net.URL
+import java.util.*
+import kotlin.coroutines.resume
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,7 +67,8 @@ class MainActivity : ComponentActivity() {
                     composable("splash") {
                         SplashScreen(
                             onSudokuClick = { navController.navigate("sudoku") },
-                            onCrosswordClick = { navController.navigate("crossword") }
+                            onCrosswordClick = { navController.navigate("crossword") },
+                            onSudokuSamariClick = { navController.navigate("sudoku_samari") }
                         )
                     }
                     composable("sudoku") {
@@ -64,6 +77,9 @@ class MainActivity : ComponentActivity() {
                     composable("crossword") {
                         CrosswordScreen(onBack = { navController.popBackStack() })
                     }
+                    composable("sudoku_samari") {
+                        SudokuSamariScreen(onBack = { navController.popBackStack() })
+                    }
                 }
             }
         }
@@ -71,7 +87,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun SplashScreen(onSudokuClick: () -> Unit, onCrosswordClick: () -> Unit) {
+fun SplashScreen(onSudokuClick: () -> Unit, onCrosswordClick: () -> Unit, onSudokuSamariClick: () -> Unit) {
     Scaffold { innerPadding ->
         Column(
             modifier = Modifier
@@ -92,7 +108,15 @@ fun SplashScreen(onSudokuClick: () -> Unit, onCrosswordClick: () -> Unit) {
                     .fillMaxWidth()
                     .padding(vertical = 8.dp)
             ) {
-                Text("Samurai Sudoku")
+                Text("Samurai Sudoku (Capture)")
+            }
+            Button(
+                onClick = onSudokuSamariClick,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 8.dp)
+            ) {
+                Text("Sudoku Samari (Space)")
             }
             Button(
                 onClick = onCrosswordClick,
@@ -106,20 +130,536 @@ fun SplashScreen(onSudokuClick: () -> Unit, onCrosswordClick: () -> Unit) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SudokuScreen(onBack: () -> Unit) {
-    Scaffold { innerPadding ->
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var webView by remember { mutableStateOf<WebView?>(null) }
+    var statusText by remember { mutableStateOf("Ready") }
+    var isProcessing by remember { mutableStateOf(false) }
+    var isPageLoaded by remember { mutableStateOf(false) }
+
+    val sudokuUrl = "https://www.samurai-sudoku.com/"
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Samurai Sudoku") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
+                .padding(innerPadding)
         ) {
-            Text("Sudoku Screen Placeholder")
-            Button(onClick = onBack, modifier = Modifier.padding(top = 16.dp)) {
-                Text("Back to Menu")
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                showSudokuCaptureDialog(context) { startDate, count ->
+                                    scope.launch {
+                                        runSudokuCaptureFlow(webView, context, startDate, count, { isProcessing = it }) { msg -> statusText = msg }
+                                    }
+                                }
+                            },
+                            enabled = isPageLoaded && !isProcessing,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text("Capture Puzzles")
+                        }
+
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    val file = File(context.cacheDir, "sudoku_puzzles.pdf")
+                                    if (file.exists()) {
+                                        printPdf(file, context)
+                                    } else {
+                                        statusText = "No PDF found. Capture first."
+                                    }
+                                }
+                            },
+                            enabled = isPageLoaded && !isProcessing
+                        ) {
+                            Icon(Icons.Default.Print, contentDescription = "Print All")
+                        }
+                        IconButton(
+                            onClick = {
+                                scope.launch {
+                                    val file = File(context.cacheDir, "sudoku_puzzles.pdf")
+                                    if (file.exists()) {
+                                        emailPdf(file, context)
+                                    } else {
+                                        statusText = "No PDF found. Capture first."
+                                    }
+                                }
+                            },
+                            enabled = isPageLoaded && !isProcessing
+                        ) {
+                            Icon(Icons.Default.Email, contentDescription = "Email All")
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(text = "Status: $statusText", style = MaterialTheme.typography.bodySmall)
+                }
             }
+
+            AndroidView(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        settings.allowFileAccess = true
+                        settings.allowContentAccess = true
+                        settings.setSupportZoom(true)
+                        settings.builtInZoomControls = true
+                        settings.displayZoomControls = false
+                        
+                        webViewClient = object : WebViewClient() {
+                            override fun shouldInterceptRequest(view: WebView?, request: WebResourceRequest?): WebResourceResponse? {
+                                if (request?.isForMainFrame == true) return null
+                                val url = request?.url?.toString()?.lowercase() ?: return null
+                                val blockedDomains = setOf("doubleclick.net", "googlesyndication.com", "taboola.com")
+                                if (blockedDomains.any { url.contains(it) }) {
+                                    return WebResourceResponse("text/plain", "UTF-8", ByteArrayInputStream("".toByteArray()))
+                                }
+                                return super.shouldInterceptRequest(view, request)
+                            }
+
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                view?.evaluateJavascript(buildSudokuAntiAdScript(), null)
+                                statusText = "Page Loaded"
+                                isPageLoaded = true
+                            }
+                        }
+                        loadUrl(sudokuUrl)
+                        webView = this
+                    }
+                }
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun SudokuSamariScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var webView by remember { mutableStateOf<WebView?>(null) }
+    var statusText by remember { mutableStateOf("Ready") }
+    var isProcessing by remember { mutableStateOf(false) }
+    var isPageLoaded by remember { mutableStateOf(false) }
+    var monthText by remember { mutableStateOf("") }
+
+    val listingUrl = "http://www.sudoku-space.com/samurai-sudoku/"
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text("Sudoku Samari (Space)") },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+        ) {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(8.dp),
+                elevation = CardDefaults.cardElevation(defaultElevation = 4.dp)
+            ) {
+                Column(modifier = Modifier.padding(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        TextField(
+                            value = monthText,
+                            onValueChange = { monthText = it },
+                            label = { Text("Month (e.g. 7)") },
+                            modifier = Modifier.weight(1f),
+                            enabled = !isProcessing
+                        )
+                        Button(
+                            onClick = {
+                                val m = monthText.toIntOrNull()
+                                if (m != null && m in 1..12) {
+                                    confirmAndProcessSudokuSpacePdfs(webView, context, scope, m, true, { isProcessing = it }) { msg -> statusText = msg }
+                                } else {
+                                    statusText = "Enter valid month (1-12)"
+                                }
+                            },
+                            enabled = isPageLoaded && !isProcessing
+                        ) {
+                            Text("Submit")
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(text = "Status: $statusText", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            IconButton(
+                                onClick = {
+                                    val m = monthText.toIntOrNull()
+                                    if (m != null && m in 1..12) {
+                                        confirmAndProcessSudokuSpacePdfs(webView, context, scope, m, true, { isProcessing = it }) { msg -> statusText = msg }
+                                    }
+                                },
+                                enabled = isPageLoaded && !isProcessing
+                            ) {
+                                Icon(Icons.Default.Print, contentDescription = "Print All")
+                            }
+                            IconButton(
+                                onClick = {
+                                    val m = monthText.toIntOrNull()
+                                    if (m != null && m in 1..12) {
+                                        confirmAndProcessSudokuSpacePdfs(webView, context, scope, m, false, { isProcessing = it }) { msg -> statusText = msg }
+                                    }
+                                },
+                                enabled = isPageLoaded && !isProcessing
+                            ) {
+                                Icon(Icons.Default.Email, contentDescription = "Email All")
+                            }
+                        }
+                    }
+                }
+            }
+
+            AndroidView(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxWidth(),
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        settings.javaScriptEnabled = true
+                        settings.domStorageEnabled = true
+                        webViewClient = object : WebViewClient() {
+                            override fun onPageFinished(view: WebView?, url: String?) {
+                                super.onPageFinished(view, url)
+                                statusText = "Page Loaded"
+                                isPageLoaded = true
+                            }
+                        }
+                        loadUrl(listingUrl)
+                        webView = this
+                    }
+                }
+            )
+        }
+    }
+}
+
+private fun confirmAndProcessSudokuSpacePdfs(webView: WebView?, context: Context, scope: CoroutineScope, month: Int, isPrint: Boolean, onProcessing: (Boolean) -> Unit, onStatus: (String) -> Unit) {
+    if (webView == null) return
+    onProcessing(true)
+
+    val js = """
+(function() {
+  const m = $month;
+  const rx = new RegExp("/samurai-sudoku/pdf/(?:0?" + m + ")-\\d{1,2}-\\d{4}/", 'i');
+  const anchors = Array.from(document.querySelectorAll("a[href*='/samurai-sudoku/pdf/']"));
+  const seen = new Set();
+  const urls = [];
+  for (const a of anchors) {
+    try {
+      const href = new URL(a.getAttribute('href'), document.baseURI).href;
+      if (rx.test(href) && !seen.has(href)) {
+        seen.add(href);
+        urls.push(href);
+      }
+    } catch (e) {}
+  }
+  return JSON.stringify(urls);
+})();
+    """.trimIndent()
+
+    onStatus("Scanning for PDF links...")
+    webView.evaluateJavascript(js) { result ->
+        try {
+            val cleanedJson = result.removeSurrounding("\"").replace("\\\"", "\"")
+            val urlsArray = JSONArray(cleanedJson)
+            val urls = mutableListOf<String>()
+            for (i in 0 until urlsArray.length()) {
+                urls.add(urlsArray.getString(i))
+            }
+
+            if (urls.isEmpty()) {
+                onStatus("No PDF links found for month $month")
+                onProcessing(false)
+                return@evaluateJavascript
+            }
+
+            val title = if (isPrint) "Download & Print" else "Download & Email"
+            val message = "Found ${urls.size} puzzles. Do you want to download, merge, and ${if (isPrint) "print" else "email"} them all?"
+
+            AlertDialog.Builder(context)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("Yes") { _, _ ->
+                    scope.launch {
+                        try {
+                            downloadAndMergePdfs(urls, context, isPrint, onStatus)
+                        } finally {
+                            onProcessing(false)
+                        }
+                    }
+                }
+                .setNegativeButton("No") { _, _ ->
+                    onProcessing(false)
+                }
+                .setOnCancelListener {
+                    onProcessing(false)
+                }
+                .show()
+
+        } catch (e: Exception) {
+            onStatus("Error scanning links: ${e.message}")
+            onProcessing(false)
+        }
+    }
+}
+
+private fun buildSudokuAntiAdScript(): String {
+    return """
+        (() => {
+          const junk = ['header', 'footer', '.ads', '.ad-container', '#top-nav', 'h1', 'p', 'form', '.don'];
+          junk.forEach(s => {
+            document.querySelectorAll(s).forEach(el => el.style.display = 'none');
+          });
+          const css = `
+            .ads,.adsbygoogle,.ad-container,.ad-container-desktop,.adslot,.adbanner,.advert,.advertisement,
+            .ad-banner,.adbox,.ad-wrapper,.sponsored,.sponsor,[data-ad],[data-ads] {
+              display:none!important;visibility:hidden!important;max-height:0!important;height:0!important;
+            }`;
+          const s = document.createElement('style');
+          s.appendChild(document.createTextNode(css));
+          (document.head || document.documentElement).appendChild(s);
+        })();
+    """.trimIndent()
+}
+
+private fun showSudokuCaptureDialog(context: Context, onConfirm: (Date, Int) -> Unit) {
+    val calendar = Calendar.getInstance()
+    DatePickerDialog(context, { _, year, month, day ->
+        val selectedDate = Calendar.getInstance().apply {
+            set(year, month, day)
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }.time
+        
+        val input = EditText(context).apply {
+            setText("5")
+            inputType = android.text.InputType.TYPE_CLASS_NUMBER
+        }
+        
+        AlertDialog.Builder(context)
+            .setTitle("Number of Puzzles")
+            .setView(input)
+            .setPositiveButton("Capture") { _, _ ->
+                val count = input.text.toString().toIntOrNull() ?: 5
+                onConfirm(selectedDate, count)
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH)).show()
+}
+
+private suspend fun runSudokuCaptureFlow(webView: WebView?, context: Context, startDate: Date, count: Int, onProcessing: (Boolean) -> Unit, onStatus: (String) -> Unit) {
+    if (webView == null) return
+    onProcessing(true)
+
+    val today = Calendar.getInstance().apply { 
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }.timeInMillis
+    
+    val startMillis = startDate.time
+    val diffDays = ((today - startMillis) / (1000 * 60 * 60 * 24)).toInt()
+    var increment = if (diffDays < 0) 0 else diffDays
+
+    val bitmaps = mutableListOf<Bitmap>()
+
+    try {
+        for (i in 0 until count) {
+            onStatus("Capturing ${i + 1}/$count...")
+            
+            val script = """
+                (function() {
+                    const sel = document.getElementById('ai');
+                    if (sel) {
+                        sel.selectedIndex = $increment;
+                        sel.dispatchEvent(new Event('change'));
+                        return true;
+                    }
+                    return false;
+                })();
+            """.trimIndent()
+            
+            withContext(Dispatchers.Main) { webView.evaluateJavascript(script, null) }
+            delay(3500) // Give time for the puzzle to change and render
+
+            val captureResult = withContext(Dispatchers.Main) {
+                // Ensure software layer for capture
+                webView.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                
+                val js = """
+                    (function() {
+                        const junk = ['header', 'footer', '.ads', '.ad-container', '#top-nav', 'h1', 'p', 'form', '.don'];
+                        junk.forEach(s => {
+                            document.querySelectorAll(s).forEach(el => el.style.display = 'none');
+                        });
+                        
+                        let puzzle = document.querySelector('svg') || document.querySelector('canvas') || document.getElementById('puzzle') || document.querySelector('table.grid');
+                        if (!puzzle) {
+                            let maxArea = 0;
+                            let largest = document.body;
+                            document.querySelectorAll('div, table').forEach(el => {
+                                let r = el.getBoundingClientRect();
+                                let area = r.width * r.height;
+                                if (area > maxArea && r.width < window.innerWidth * 0.99) {
+                                    maxArea = area;
+                                    largest = el;
+                                }
+                            });
+                            puzzle = largest;
+                        }
+                        puzzle.scrollIntoView({block: 'start', inline: 'center'});
+                        window.scrollTo(0, 0);
+                        
+                        const rect = puzzle.getBoundingClientRect();
+                        return JSON.stringify({
+                            x: rect.left,
+                            y: rect.top,
+                            width: rect.width,
+                            height: rect.height,
+                            scale: window.devicePixelRatio
+                        });
+                    })();
+                """.trimIndent()
+                
+                val resultJson = suspendCancellableCoroutine<String?> { cont ->
+                    webView.evaluateJavascript(js) { res -> cont.resume(res) }
+                }
+                
+                if (resultJson != null && resultJson != "null") {
+                    val json = JSONObject(resultJson.removeSurrounding("\"").replace("\\\"", "\""))
+                    val x = (json.getDouble("x") * json.getDouble("scale")).toInt()
+                    val y = (json.getDouble("y") * json.getDouble("scale")).toInt()
+                    val w = (json.getDouble("width") * json.getDouble("scale")).toInt()
+                    val h = (json.getDouble("height") * json.getDouble("scale")).toInt()
+
+                    val fullBitmap = Bitmap.createBitmap(webView.width, webView.height, Bitmap.Config.ARGB_8888)
+                    val canvas = Canvas(fullBitmap)
+                    webView.draw(canvas)
+                    
+                    val cropped = try {
+                        Bitmap.createBitmap(fullBitmap, 
+                            x.coerceIn(0, fullBitmap.width - 1), 
+                            y.coerceIn(0, fullBitmap.height - 1), 
+                            w.coerceAtMost(fullBitmap.width - x), 
+                            h.coerceAtMost(fullBitmap.height - y))
+                    } catch (e: Exception) {
+                        fullBitmap
+                    }
+                    if (cropped != fullBitmap) fullBitmap.recycle()
+                    cropped
+                } else {
+                    null
+                }
+            }
+
+            if (captureResult != null) {
+                bitmaps.add(captureResult)
+            }
+            
+            increment++
+        }
+
+        if (bitmaps.isNotEmpty()) {
+            onStatus("Merging into PDF...")
+            saveBitmapsToPdf(bitmaps, context, "sudoku_puzzles.pdf")
+            onStatus("Done! PDF ready.")
+        } else {
+            onStatus("No puzzles captured.")
+        }
+
+    } catch (e: Exception) {
+        onStatus("Error: ${e.message}")
+    } finally {
+        onProcessing(false)
+    }
+}
+
+private suspend fun saveBitmapsToPdf(bitmaps: List<Bitmap>, context: Context, fileName: String) {
+    withContext(Dispatchers.IO) {
+        val document = PDDocument()
+        try {
+            for (bitmap in bitmaps) {
+                val page = PDPage(PDRectangle.LETTER)
+                document.addPage(page)
+                
+                val pdImage = LosslessFactory.createFromImage(document, bitmap)
+                PDPageContentStream(document, page).use { contentStream ->
+                    val pageWidth = PDRectangle.LETTER.width
+                    val pageHeight = PDRectangle.LETTER.height
+                    val imgWidth = pdImage.width.toFloat()
+                    val imgHeight = pdImage.height.toFloat()
+                    
+                    val scale = Math.min(pageWidth / imgWidth, (pageHeight - 50) / imgHeight) * 0.95f
+                    val drawWidth = imgWidth * scale
+                    val drawHeight = imgHeight * scale
+                    val x = (pageWidth - drawWidth) / 2
+                    val y = (pageHeight - drawHeight) / 2
+                    
+                    contentStream.drawImage(pdImage, x, y, drawWidth, drawHeight)
+                }
+                bitmap.recycle()
+            }
+            val file = File(context.cacheDir, fileName)
+            document.save(file)
+        } finally {
+            document.close()
         }
     }
 }
@@ -563,8 +1103,8 @@ private fun emailPdf(file: File, context: Context) {
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "application/pdf"
             putExtra(Intent.EXTRA_STREAM, uri)
-            putExtra(Intent.EXTRA_SUBJECT, "Crossword Puzzles")
-            putExtra(Intent.EXTRA_TEXT, "Attached are the merged crossword puzzles.")
+            putExtra(Intent.EXTRA_SUBJECT, "Puzzles")
+            putExtra(Intent.EXTRA_TEXT, "Attached are the merged puzzles.")
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         // Chooser helps ensure the user can select their email app
